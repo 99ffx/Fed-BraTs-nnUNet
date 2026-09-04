@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local BraTS dataset
+dataset/
+
+._*
+.DS_Store
+.python-version
+pyproject.toml
+uv.lock
