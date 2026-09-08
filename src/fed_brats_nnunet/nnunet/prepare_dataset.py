@@ -3,7 +3,11 @@ import json
 import shutil
 from pathlib import Path
 
+import numpy as np
+import SimpleITK as sitk
+
 MODALITIES = ["t1", "t1ce", "t2", "flair"]
+BRAts_LABELS = {0, 1, 2, 4}
 
 
 def read_split(site_dir, split):
@@ -24,35 +28,67 @@ def add_file(source, target, copy_files):
         target.hardlink_to(source)
 
 
+def add_segmentation(source, target, copy_files):
+    """Convert BraTS labels (0, 1, 2, 4) to nnUNet labels (0, 1, 2, 3)."""
+    image = sitk.ReadImage(source)
+    array = sitk.GetArrayFromImage(image)
+    unexpected = set(np.unique(array).tolist()) - BRAts_LABELS
+    if unexpected:
+        raise ValueError(
+            f"Unexpected labels {sorted(unexpected)} in {source}; "
+            "expected only 0, 1, 2, and 4."
+        )
+
+    converted = np.zeros_like(array)
+    converted[array == 2] = 1  # edema
+    converted[array == 1] = 2  # necrotic/non-enhancing tumor
+    converted[array == 4] = 3  # enhancing tumor
+    output = sitk.GetImageFromArray(converted)
+    output.CopyInformation(image)
+    sitk.WriteImage(output, target)
+
+
+def clear_generated_files(*directories):
+    for directory in directories:
+        directory.mkdir(parents=True, exist_ok=True)
+        for file in directory.glob("*.nii.gz"):
+            file.unlink()
+
+
 def prepare_site(site_dir, source_dir, output_dir, copy_files):
     train = read_split(site_dir, "train")
     val = read_split(site_dir, "val")
     test = read_split(site_dir, "test")
-    case_ids = train + val + test
+    training_cases = train + val
 
-    images = output_dir / "imagesTr"
+    images_tr = output_dir / "imagesTr"
+    images_ts = output_dir / "imagesTs"
     labels = output_dir / "labelsTr"
-    images.mkdir(parents=True, exist_ok=True)
-    labels.mkdir(parents=True, exist_ok=True)
+    clear_generated_files(images_tr, images_ts, labels)
 
-    for case_id in case_ids:
+    for case_id in training_cases:
         case_dir = source_dir / case_id
         for channel, modality in enumerate(MODALITIES):
             add_file(
                 case_dir / f"{case_id}_{modality}.nii.gz",
-                images / f"{case_id}_{channel:04d}.nii.gz",
+                images_tr / f"{case_id}_{channel:04d}.nii.gz",
                 copy_files,
             )
-        add_file(
-            case_dir / f"{case_id}_seg.nii.gz",
-            labels / f"{case_id}.nii.gz",
-            copy_files,
-        )
+        add_segmentation(case_dir / f"{case_id}_seg.nii.gz", labels / f"{case_id}.nii.gz", copy_files)
+
+    for case_id in test:
+        case_dir = source_dir / case_id
+        for channel, modality in enumerate(MODALITIES):
+            add_file(
+                case_dir / f"{case_id}_{modality}.nii.gz",
+                images_ts / f"{case_id}_{channel:04d}.nii.gz",
+                copy_files,
+            )
 
     dataset = {
         "channel_names": {"0": "T1", "1": "T1ce", "2": "T2", "3": "FLAIR"},
-        "labels": {"background": 0, "NCR": 1, "ED": 2, "ET": 3},
-        "numTraining": len(case_ids),
+        "labels": {"background": 0, "ED": 1, "NCR": 2, "ET": 3},
+        "numTraining": len(training_cases),
         "file_ending": ".nii.gz",
     }
     (output_dir / "dataset.json").write_text(json.dumps(dataset, indent=2) + "\n")
@@ -61,7 +97,10 @@ def prepare_site(site_dir, source_dir, output_dir, copy_files):
     )
     (output_dir / "test_cases.json").write_text(json.dumps(test, indent=2) + "\n")
 
-    print(f"{site_dir.name}: train={len(train)}, val={len(val)}, test={len(test)}")
+    print(
+        f"{site_dir.name}: imagesTr={len(training_cases)}, "
+        f"imagesTs={len(test)}, train={len(train)}, val={len(val)}"
+    )
 
 
 def main():
