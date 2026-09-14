@@ -218,8 +218,9 @@ __marimo__/
 .streamlit/secrets.toml
 
 # Local BraTS dataset
-raw/
+original_data/
 splits/
+nnUNet_data/
 
 ._*
 .DS_Store
