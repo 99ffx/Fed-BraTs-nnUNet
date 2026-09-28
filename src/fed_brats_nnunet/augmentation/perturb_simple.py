@@ -1,30 +1,24 @@
-"""Simple binary morphology on the tumour core, using scipy.ndimage directly.
+"""Perturb the BraTS tumour core by a percentage, using scipy.ndimage morphology.
 
-    +n  dilate n iterations   (over-segment)
-    -n  erode n iterations    (under-segment)
-     0  unchanged
+    perturb_core(seg, +30)   core ends up ~30% bigger   (over-segmentation)
+    perturb_core(seg, -30)   core ends up ~30% smaller  (under-segmentation)
+    perturb_core(seg,   0)   unchanged
 
 Labels in  : raw BraTS (0,1,2,4), nnU-Net (0,1,2,3) or merged (0,1,2)
-Labels out : chosen with `output`
-    "binary" (default)  0 background (edema included), 1 tumour core
-    "merged"            0 background, 1 edema, 2 tumour core
+Labels out : "binary" (default) -> 0 background, 1 core
+             "merged"           -> 0 background, 1 edema, 2 core
 
-NOTE ON BINARY OUTPUT
----------------------
-Binary output changes the nnU-Net task from three nested regions to one region.
-That means:
-  * dataset.json becomes  {"background": 0, "tumor core": 1}
-    with NO regions_class_order
-  * your existing 3-region baseline is no longer comparable -- you need a
-    binary centralized baseline to compare the perturbation runs against
-Edema is still read from the input and still used as the fence for clipping
-(preserve_wt); it is just not written to the output.
+HOW PERCENT WORKS
+-----------------
+Morphology grows or shrinks one voxel layer at a time, so volume moves in jumps.
+This applies layers one at a time and keeps whichever count lands CLOSEST to the
+requested percentage. On small cores the closest may still be far off -- always
+read info["volume_change_pct"], never assume you got what you asked for.
 """
 
 import numpy as np
 from scipy import ndimage
 
-# which values mean "tumour core" in each convention
 _TC = {"raw_brats": [1, 4], "nnunet": [2, 3], "merged": [2], "binary": [1]}
 
 
@@ -39,32 +33,40 @@ def detect_convention(seg):
     return "binary"
 
 
-def perturb_core(seg, iterations, preserve_wt=True, min_core_voxels=10,
-                 output="binary", structure=None):
-    """Dilate (+) or erode (-) the tumour core by `iterations` voxels.
+def perturb_core(seg, pct, preserve_wt=True, min_core_voxels=10,
+                 output="binary", structure=None, max_layers=40):
+    """Change the tumour core volume by roughly `pct` percent.
 
-    preserve_wt=True   core cannot grow past the original lesion boundary
-    preserve_wt=False  core may grow into background
-    output             "binary" -> 0/1   |   "merged" -> 0/1/2
-    structure          optional structuring element, e.g. skimage ball(2).
-                       Pass it WITHOUT iterations>1 or you compound the radius.
-
-    Returns (new_seg, info).
+    pct > 0 dilates, pct < 0 erodes.
+    preserve_wt=True keeps the core inside the original lesion boundary.
     """
     tc = np.isin(seg, _TC[detect_convention(seg)])
-    wt = seg > 0                      # lesion, read from the INPUT
+    wt = seg > 0                       # lesion, read from the INPUT
     n0 = int(tc.sum())
 
-    if iterations > 0:
-        tc_new = ndimage.binary_dilation(tc, structure=structure,
-                                         iterations=iterations)
-    elif iterations < 0:
-        tc_new = ndimage.binary_erosion(tc, structure=structure,
-                                        iterations=-iterations)
-    else:
-        tc_new = tc.copy()
+    # --- apply layers one at a time, keep the closest to target ---
+    tc_new = tc.copy()
+    layers = 0
+    if pct != 0 and n0 > 0:
+        target = n0 * (1.0 + pct / 100.0)
+        best, best_err, best_n = tc.copy(), abs(n0 - target), 0
+        cur = tc
+        for n in range(1, max_layers + 1):
+            if pct > 0:
+                cur = ndimage.binary_dilation(cur, structure=structure)
+                if preserve_wt:
+                    cur = cur & wt
+            else:
+                cur = ndimage.binary_erosion(cur, structure=structure)
+            err = abs(int(cur.sum()) - target)
+            if err < best_err:
+                best, best_err, best_n = cur.copy(), err, n
+            else:
+                break                  # volume is monotone, so we passed the optimum
+            if not cur.any():
+                break
+        tc_new, layers = best, best_n
 
-    # the core may not escape the lesion it came from
     if preserve_wt:
         tc_new = tc_new & wt
         wt_new = wt
@@ -75,41 +77,24 @@ def perturb_core(seg, iterations, preserve_wt=True, min_core_voxels=10,
     floored = False
     if n0 > 0 and int(tc_new.sum()) < min(min_core_voxels, n0):
         tc_new = (tc & wt) if preserve_wt else tc
-        floored = True
+        layers, floored = 0, True
 
     out = np.zeros_like(seg, dtype=np.uint8)
     if output == "binary":
-        out[tc_new] = 1               # edema falls into background
+        out[tc_new] = 1                # edema falls into background
     elif output == "merged":
-        out[wt_new] = 1               # lesion -> edema
-        out[tc_new] = 2               # core overwrites
+        out[wt_new] = 1                # lesion -> edema
+        out[tc_new] = 2                # core overwrites
     else:
         raise ValueError(f"output must be 'binary' or 'merged', got {output!r}")
 
-    core_value = 1 if output == "binary" else 2
-    n1 = int((out == core_value).sum())
+    n1 = int((out == (1 if output == "binary" else 2)).sum())
     return out, {
-        "iterations": iterations,
-        "output": output,
+        "pct_requested": pct,
+        "volume_change_pct": 100.0 * (n1 - n0) / n0 if n0 else 0.0,
+        "layers_used": layers,
         "core_before": n0,
         "core_after": n1,
-        "volume_change_pct": 100.0 * (n1 - n0) / n0 if n0 else 0.0,
         "core_floored": floored,
+        "output": output,
     }
-
-
-def perturb_core_pct(seg, pct, max_iter=30, **kw):
-    """Same thing, but keep adding iterations until the core volume has changed
-    by about `pct` percent. Stops at the first iteration that reaches the target.
-    """
-    if pct == 0:
-        return perturb_core(seg, 0, **kw)
-
-    step = 1 if pct > 0 else -1
-    best = perturb_core(seg, 0, **kw)
-    for i in range(1, max_iter + 1):
-        out, info = perturb_core(seg, i * step, **kw)
-        best = (out, info)
-        if abs(info["volume_change_pct"]) >= abs(pct) or info["core_floored"]:
-            break
-    return best
